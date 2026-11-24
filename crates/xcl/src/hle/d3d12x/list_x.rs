@@ -1157,22 +1157,27 @@ unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
 ///
 /// Returns `true` iff emitting `sig_q.Signal` for `(target_va, sig_val)` would close a cycle.
 unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_va: u64, sig_val: u64) -> bool {
-    // Prune completed waits/signals on target cell first.
-    let target_waiters: Vec<(usize, u64)> = {
+    // Prune completed waits/signals on target cell first. A wait that a Signal already in flight
+    // satisfies (`true`) does not wait for this Signal: it stays in `edges` as an ordinary edge to
+    // that Signal, so a cycle through it is still found.
+    let target_waiters: Vec<(usize, u64, bool)> = {
         let Some(target) = graph.cells.get_mut(&target_va) else { return false };
         let completed = prune_completed_waits(target);
         if completed == u64::MAX || target.armed_waits.is_empty() {
             return false;
         }
-        target.armed_waits.iter().filter(|aw| aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq)).collect()
+        let in_flight = |val: u64| target.submitted_signals.iter().any(|s| s.val >= val);
+        target.armed_waits.iter().filter(|aw| aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq, in_flight(aw.val))).collect()
     };
     if target_waiters.is_empty() {
         return false;
     }
     // k = 1: direct same-queue self-deadlock (`sig_q` is already waiting on `target_va <= sig_val`).
-    if target_waiters.iter().any(|&(wq, _)| wq == sig_q) {
+    if target_waiters.iter().any(|&(wq, _, satisfied)| wq == sig_q && !satisfied) {
         return true;
     }
+    // Set where only a satisfied wait closes the path (counted as a cycle before, logged below).
+    let mut kept = target_waiters.iter().any(|&(wq, _, _)| wq == sig_q);
 
     // Prune all cells & title fences and build exact edge list: (waiter_q, wait_seq, prod_q, prod_sig_seq).
     // Include earlier submitted signals on `target_va` too (e.g. frame N-1 wait -> signal).
@@ -1200,9 +1205,6 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
             }
         }
     }
-    if edges.is_empty() {
-        return false;
-    }
 
     // BFS over `(queue, limit_seq)`: all waits on `sig_q` sit before our new `sig_q.Signal` (`u64::MAX`).
     let mut best_limit: HashMap<usize, u64> = HashMap::new();
@@ -1215,14 +1217,26 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
             }
             // If `pq` has a wait on `target_va <= sig_val` strictly BEFORE `pq`'s signal `pseq`,
             // then `pq`'s signal cannot execute until `target_va` completes -> exact cycle!
-            if target_waiters.iter().any(|&(twq, twseq)| twq == pq && twseq < pseq) {
-                return true;
+            for &(_, _, satisfied) in target_waiters.iter().filter(|&&(twq, twseq, _)| twq == pq && twseq < pseq) {
+                if !satisfied {
+                    return true;
+                }
+                kept = true;
             }
             let prev = best_limit.get(&pq).copied().unwrap_or(0);
             if pseq > prev {
                 best_limit.insert(pq, pseq);
                 stack.push((pq, pseq));
             }
+        }
+    }
+    if kept {
+        static KEPT: AtomicU64 = AtomicU64::new(0);
+        if once(&KEPT, 16) {
+            crate::xlog_info!(
+                "D3D12.X: Write64 Signal at {target_va:#x} = {sig_val:#x} on q{} stays on the GPU: the waits it seemed to close a cycle with are satisfied by a Signal in flight",
+                queue_id(sig_q)
+            );
         }
     }
     false
@@ -6146,6 +6160,189 @@ mod tests {
             assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
+        }
+    }
+
+    fn armed_wait(q: usize, val: u64, seq: u64) -> ArmedGpuWait {
+        ArmedGpuWait { val, waiting_queue: q, waiting_queue_ty: 0, wait_seq: seq, armed_at: Instant::now(), after_write64: false }
+    }
+
+    /// A cell with armed waits and Signals in flight `(val, queue, seq)`, without a fence.
+    fn sync_cell(waits: Vec<ArmedGpuWait>, signals: &[(u64, usize, u64)]) -> SyncCell {
+        let submitted_signals = signals.iter().map(|&(val, queue, seq)| SubmittedSignal { val, queue, seq }).collect();
+        SyncCell { recorded_max: 11, armed_waits: waits, submitted_signals, ..Default::default() }
+    }
+
+    const PP_Q0: usize = 0xC000;
+    const PP_Q3: usize = 0xD000;
+
+    /// A direct queue q3 and a compute queue q0 one frame behind, before q0's `Signal(C=11)`:
+    /// q3: 1 Signal(D=10), 2 Wait(C>=10), 3 Signal(D=11), 4 Wait(C>=11)
+    /// q0: 1 Wait(D>=10),  2 Signal(C=10), 3 Wait(D>=11)
+    /// With `cycle`, q3 waits for C>=11 (3) before it signals D=11 (4): a real cycle.
+    fn ping_pong(c: u64, d: u64, cycle: bool) -> SyncGraph {
+        let (wait11, sig11) = if cycle { (3, 4) } else { (4, 3) };
+        let mut g = SyncGraph::default();
+        g.cells.insert(c, sync_cell(vec![armed_wait(PP_Q3, 10, 2), armed_wait(PP_Q3, 11, wait11)], &[(10, PP_Q0, 2)]));
+        g.cells.insert(d, sync_cell(vec![armed_wait(PP_Q0, 10, 1), armed_wait(PP_Q0, 11, 3)], &[(10, PP_Q3, 1), (11, PP_Q3, sig11)]));
+        g
+    }
+
+    /// A wait that a Signal already in flight satisfies does not wait for the new Signal: q3's
+    /// Wait(C>=10) passes once q0's Signal(C=10) runs, which is ahead of everything q0 does next.
+    #[test]
+    fn waits_a_signal_in_flight_satisfies_do_not_close_a_cycle() {
+        unsafe {
+            let mut g = ping_pong(0x1000, 0x2000, false);
+            assert!(!would_signal_close_cycle(&mut g, PP_Q0, 0x1000, 11), "frame ping-pong one frame behind is not a cycle");
+            // k = 1 shape: q0 waits for E>=10, which q3's Signal(E=10) in flight satisfies, then writes E=11.
+            let mut g = SyncGraph::default();
+            g.cells.insert(0x3000, sync_cell(vec![armed_wait(PP_Q0, 10, 1)], &[(10, PP_Q3, 1)]));
+            assert!(!would_signal_close_cycle(&mut g, PP_Q0, 0x3000, 11), "a self wait another queue's Signal in flight satisfies is not a cycle");
+        }
+    }
+
+    #[test]
+    fn cycles_through_waits_a_signal_in_flight_satisfies_are_still_found() {
+        unsafe {
+            let mut g = ping_pong(0x1000, 0x2000, true);
+            assert!(would_signal_close_cycle(&mut g, PP_Q0, 0x1000, 11), "q3 waits for C>=11 before it signals D=11");
+            // k = 1: no Signal in flight reaches the self wait's value.
+            let mut g = SyncGraph::default();
+            g.cells.insert(0x3000, sync_cell(vec![armed_wait(PP_Q0, 11, 1)], &[(10, PP_Q3, 1)]));
+            assert!(would_signal_close_cycle(&mut g, PP_Q0, 0x3000, 11), "a self wait for the new value is a cycle");
+            // The Signal in flight that satisfies q0's self wait sits behind q3's wait for the new value.
+            let mut g = SyncGraph::default();
+            g.cells.insert(0x3000, sync_cell(vec![armed_wait(PP_Q3, 11, 1), armed_wait(PP_Q0, 10, 1)], &[(10, PP_Q3, 2)]));
+            assert!(would_signal_close_cycle(&mut g, PP_Q0, 0x3000, 11), "a cycle through a satisfied wait's producer");
+        }
+    }
+
+    fn test_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().ok()?.EnumWarpAdapter::<IDXGIAdapter>().ok()?;
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
+            }
+            dev
+        }
+    }
+
+    /// The same ping-pong with a title fence T in place of C, before q0's title Signal(T=11). Title
+    /// fences stay conservative: CPU Signals are not recorded and a reset or reused fence keeps old
+    /// Signals listed, so every wait on T at or below the value counts, satisfied or not. A stale
+    /// Signal(T=20) must not hide the cycle q3: Wait(T>=10) Signal(D=10); q0: Wait(D>=10) Signal(T=10).
+    #[test]
+    fn title_signal_releases_cells_for_every_wait_at_or_below_it() {
+        unsafe {
+            let Some(dev) = test_device() else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            let t: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (tf, d) = (t.as_raw() as usize, 0x5050_0008u64);
+            let mut stale = SyncGraph::default();
+            stale.cells.insert(0, sync_cell(vec![armed_wait(PP_Q3, 10, 1)], &[(20, 0xE000, 1)]));
+            stale.cells.insert(d, sync_cell(vec![armed_wait(PP_Q0, 10, 1)], &[(10, PP_Q3, 2)]));
+            for (name, mut pp, val) in [("stale title Signal", stale, 10), ("backlog", ping_pong(0, d, false), 11), ("cycle", ping_pong(0, d, true), 11)] {
+                {
+                    let mut g = SYNC_GRAPH.lock().unwrap();
+                    let gr = g.get_or_insert_with(SyncGraph::default);
+                    let c = pp.cells.remove(&0).unwrap();
+                    let waits = c.armed_waits.iter().map(|aw| (aw.val, aw.waiting_queue, aw.wait_seq)).collect();
+                    gr.title_fences.insert(tf, TitleFenceSync { waits, signals: c.submitted_signals });
+                    ARMED_GPU_WAITS.fetch_add(pp.cells[&d].armed_waits.len(), Ordering::AcqRel);
+                    gr.cells.extend(pp.cells);
+                }
+                break_cycles_before_title_signal(PP_Q0, tf, val);
+                let released = {
+                    let mut g = SYNC_GRAPH.lock().unwrap();
+                    let gr = g.as_mut().unwrap();
+                    gr.title_fences.remove(&tf);
+                    let cell = gr.cells.remove(&d).unwrap();
+                    ARMED_GPU_WAITS.fetch_sub(cell.armed_waits.len(), Ordering::AcqRel);
+                    cell.cpu_signaled_max
+                };
+                assert_eq!(released, val, "{name}: D must be released on the CPU");
+            }
+        }
+    }
+
+    /// The ping-pong on real queues, the direct queue held behind a gate (a long dispatch): frame
+    /// N+1's Signals must stay on the GPU while the gate holds frame N, then everything drains.
+    #[test]
+    fn gated_ping_pong_keeps_the_next_frame_on_the_gpu() {
+        unsafe {
+            let Some(dev) = test_device() else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            let (direct, compute) = (D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            let dq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: direct, ..Default::default() }).unwrap();
+            let cq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: compute, ..Default::default() }).unwrap();
+            let fence = || -> ID3D12Fence { dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
+            let (gate, done_d, done_c) = (fence(), fence(), fence());
+            let (cell_c, cell_d) = (Box::new(AtomicU64::new(0)), Box::new(AtomicU64::new(0)));
+            let (va_c, va_d) = (&*cell_c as *const AtomicU64 as u64, &*cell_d as *const AtomicU64 as u64);
+            let list = |ty| {
+                let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+                let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &a, None).unwrap();
+                on_create(l.as_raw(), a.as_raw() as usize, 0, ty);
+                (a, l)
+            };
+            let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+            let d: Vec<_> = (0..4).map(|_| list(direct)).collect();
+            let c: Vec<_> = (0..4).map(|_| list(compute)).collect();
+            note_write64_recorded(d[0].1.as_raw(), va_d, 10);
+            wait64_x(d[1].1.as_raw(), va_c, ge, 10, 1, 0);
+            note_write64_recorded(d[2].1.as_raw(), va_d, 11);
+            wait64_x(d[3].1.as_raw(), va_c, ge, 11, 1, 0);
+            wait64_x(c[0].1.as_raw(), va_d, ge, 10, 1, 0);
+            note_write64_recorded(c[1].1.as_raw(), va_c, 10);
+            wait64_x(c[2].1.as_raw(), va_d, ge, 11, 1, 0);
+            note_write64_recorded(c[3].1.as_raw(), va_c, 11);
+            for (_, l) in d.iter().chain(&c) {
+                l.Close().unwrap();
+            }
+            let submit = |q: &ID3D12CommandQueue, l: &ID3D12GraphicsCommandList| {
+                let cl: ID3D12CommandList = l.cast().unwrap();
+                execute_with_waits_on(q.as_raw(), &[l.as_raw()], |chunk| {
+                    q.ExecuteCommandLists(&[Some(cl.clone())]);
+                    signal_write64_fences(q.as_raw(), chunk);
+                });
+            };
+            dq.Wait(&gate, 1).unwrap();
+            submit(&dq, &d[0].1);
+            submit(&cq, &c[0].1);
+            submit(&cq, &c[1].1);
+            submit(&dq, &d[1].1);
+            submit(&dq, &d[2].1); // D=11: q0's Wait(D>=10) is satisfied by q3's Signal(D=10) in flight
+            submit(&dq, &d[3].1);
+            submit(&cq, &c[2].1);
+            submit(&cq, &c[3].1); // C=11: q3's Wait(C>=10) is satisfied by q0's Signal(C=10) in flight
+            dq.Signal(&done_d, 1).unwrap();
+            cq.Signal(&done_c, 1).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            let cpu_released = {
+                let g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.as_ref().unwrap();
+                (gr.cells[&va_d].cpu_signaled_max, gr.cells[&va_c].cpu_signaled_max)
+            };
+            let ran_ahead = (done_d.GetCompletedValue(), done_c.GetCompletedValue());
+            // open the gate before asserting, so a failure does not leave a queue waiting
+            gate.Signal(1).unwrap();
+            let drained_d = crate::gpu::fence::wait(&done_d, 1, &dev, None, 2000).is_ok();
+            let drained_c = crate::gpu::fence::wait(&done_c, 1, &dev, None, 2000).is_ok();
+            for (_, l) in d.iter().chain(&c) {
+                on_release(l.as_raw() as usize);
+            }
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                for va in [va_c, va_d] {
+                    if let Some(mut cell) = gr.cells.remove(&va) {
+                        prune_completed_waits(&mut cell);
+                    }
+                }
+            }
+            assert_eq!(cpu_released, (0, 0), "(D, C) signalled on the CPU while the gate held frame N");
+            assert_eq!(ran_ahead, (0, 0), "(direct, compute) ran past their waits before the gate opened");
+            assert!(drained_d && drained_c, "both queues must drain once the gate opens");
         }
     }
 }
